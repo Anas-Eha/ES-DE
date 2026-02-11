@@ -27,6 +27,10 @@
 #include "views/GamelistView.h"
 #include "views/ViewController.h"
 
+#if defined(RETRODECK)
+#include "CommandServer.h"
+#endif
+
 #if defined(__ANDROID__)
 #include "utils/PlatformUtilAndroid.h"
 #endif
@@ -2115,6 +2119,36 @@ void FileData::launchGame()
     Scripting::fireEvent("game-start", romPath, getSourceFileData()->metadata.get("name"),
                          getSourceFileData()->getSystem()->getName(),
                          getSourceFileData()->getSystem()->getFullName());
+
+#if defined(RETRODECK)
+    // Process any pending commands from CommandServer (e.g., MODIFYROMPATH).
+    // This allows external scripts to dynamically modify the ROM path before launch.
+    CommandServer::getInstance()->executePendingCommands();
+    if (auto overridePath = CommandServer::getInstance()->consumePathOverride()) {
+        LOG(LogInfo) << "FileData::launchGame(): Overriding ROM path from " << romPath
+                     << " to " << *overridePath;
+        std::string originalRomPath {romPath};
+        std::string originalRomRaw {romRaw};
+        std::string originalBaseName {baseName};
+
+        romPath = Utils::FileSystem::getEscapedPath(*overridePath);
+        romRaw = Utils::FileSystem::getPreferredPath(*overridePath);
+        baseName = Utils::FileSystem::getStem(*overridePath);
+
+        // Debug: Show command BEFORE rebuild
+        LOG(LogDebug) << "FileData::launchGame(): Command BEFORE rebuild: " << command;
+
+        // Simple string replacement: swap original paths with new paths.
+        // This preserves already-resolved emulator paths unlike commandRaw rebuild.
+        command = Utils::String::replace(command, originalRomPath, romPath);
+        command = Utils::String::replace(command, originalRomRaw, romRaw);
+        command = Utils::String::replace(command, originalBaseName, baseName);
+
+        // Debug: Show command AFTER rebuild
+        LOG(LogDebug) << "FileData::launchGame(): Command AFTER rebuild: " << command;
+    }
+#endif
+
     int returnValue {0};
 
     LOG(LogDebug) << "Raw emulator launch command:";
