@@ -118,6 +118,11 @@ if(WIN32)
     list(APPEND ES_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/assets/ES-DE.rc)
 endif()
 
+if(RETRODECK)
+    list(APPEND ES_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/src/CommandServer.h)
+    list(APPEND ES_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/CommandServer.cpp)
+endif()
+
 #---------------------------------------------------------------------------------------------------
 # OS-specific installation and package generation setup.
 

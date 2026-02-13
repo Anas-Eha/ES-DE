@@ -16,6 +16,9 @@
 #include "ApplicationVersion.h"
 #include "AudioManager.h"
 #include "CollectionSystemsManager.h"
+#if defined(RETRODECK)
+#include "CommandServer.h"
+#endif
 #include "InputManager.h"
 #include "Log.h"
 #include "MameNames.h"
@@ -540,11 +543,28 @@ void applicationLoop()
 #endif
                 InputManager::getInstance().parseEvent(event);
 
+                if (event.type == SDL_WINDOWEVENT &&
+                    event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+#if defined(RETRODECK)
+                    // Execute any pending commands from CommandServer that were queued
+                    // while ES-DE was in the background.
+                    CommandServer::getInstance()->executePendingCommands();
+#endif
+                }
+
                 if (event.type == SDL_QUIT)
 #if !defined(__EMSCRIPTEN__)
                     return;
 #else
                 SDL_Quit();
+#endif
+
+#if defined(RETRODECK)
+                // Handle external command events from CommandServer FIFO.
+                if (event.type == CommandServer::getSDLUserEventType()) {
+                    LOG(LogInfo) << "Main loop: Processing commands from CommandServer";
+                    CommandServer::getInstance()->executePendingCommands();
+                }
 #endif
             } while (SDL_PollEvent(&event));
         }
@@ -1228,6 +1248,11 @@ int main(int argc, char* argv[])
         // Generate controller events since we're done loading.
         SDL_GameControllerEventState(SDL_ENABLE);
 
+#if defined(RETRODECK)
+        // Start the external command server for IPC.
+        CommandServer::getInstance()->start();
+#endif
+
         lastTime = SDL_GetTicks();
 
 #if defined(APPLICATION_UPDATER)
@@ -1304,6 +1329,12 @@ int main(int argc, char* argv[])
 
     HttpReq::cleanupCurlMulti();
     TextureResource::setExit();
+
+#if defined(RETRODECK)
+    // Stop the external command server.
+    CommandServer::getInstance()->stop();
+#endif
+
     CollectionSystemsManager::getInstance()->deinit(true);
     SystemData::deleteSystems();
     NavigationSounds::getInstance().deinit();

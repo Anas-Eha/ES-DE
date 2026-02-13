@@ -1,0 +1,426 @@
+//
+//  SPDX-License-Identifier: MIT
+//
+//  ES-DE Frontend
+//  CommandServer.cpp
+//
+//  Provides a named pipe (FIFO) interface for external commands.
+//
+
+#include "CommandServer.h"
+
+#if defined(RETRODECK)
+
+#include "views/ViewController.h"
+#include "Log.h"
+#include "Settings.h"
+#include "Window.h"
+
+#include <filesystem>
+
+#include <SDL_events.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <thread>
+
+// Constants
+static constexpr size_t BUFFER_SIZE = 256;
+static constexpr int SELECT_TIMEOUT_MS = 200;
+static constexpr mode_t FIFO_PERMISSIONS = 0644;
+static constexpr size_t MAX_COMMAND_BUFFER_SIZE = 4096; // Prevent unbounded growth
+static constexpr const char* COMMAND_PREFIX = "ESDE:";
+
+// Static member definition
+std::once_flag CommandServer::s_sdlInitFlag;
+Uint32 CommandServer::s_sdlEventType = 0;
+
+CommandServer* CommandServer::getInstance()
+{
+    static CommandServer instance;
+    return &instance;
+}
+
+CommandServer::CommandServer()
+    : m_running(false)
+    , m_fifoFd(-1)
+{
+    initializeCommandRegistry();
+}
+
+CommandServer::~CommandServer()
+{
+    stop();
+}
+
+// ============================================================================
+// COMMAND REGISTRY
+// ============================================================================
+// Add new commands here. Each command maps to a handler function.
+// Set coalesce=true to prevent duplicate commands from queueing.
+
+void CommandServer::initializeCommandRegistry()
+{
+    // Register RESCAN command (coalesces duplicates)
+    registerCommand(std::string(COMMAND_PREFIX) + "RESCAN", [this](const std::string& payload) {
+        (void)payload; // No payload expected for rescan
+        ViewController::getInstance()->rescanROMDirectory();
+    }, true);
+
+    // Register MODIFYROMPATH command (coalesces duplicates)
+    registerCommand(std::string(COMMAND_PREFIX) + "MODIFYROMPATH", [this](const std::string& payload) {
+        if (payload.empty()) {
+            LOG(LogWarning) << "CommandServer: MODIFYROMPATH received without payload";
+            return;
+        }
+        setPathOverride(payload);
+        LOG(LogInfo) << "CommandServer: MODIFYROMPATH set override to: " << payload;
+    }, true);
+}
+
+void CommandServer::registerCommand(const std::string& name,
+                                      CommandHandler handler,
+                                      bool coalesce)
+{
+    m_commandRegistry[name] = {handler, coalesce};
+}
+
+std::pair<std::string, std::string> CommandServer::parseCommandWithPayload(
+    const std::string& rawCommand) const
+{
+    // Look for the payload separator " ::"
+    size_t separatorPos = rawCommand.find(PAYLOAD_SEPARATOR);
+
+    if (separatorPos == std::string::npos) {
+        // No payload - return command as-is with empty payload
+        return {rawCommand, ""};
+    }
+
+    // Extract command (before separator) and payload (after separator)
+    std::string command = rawCommand.substr(0, separatorPos);
+    std::string payload = rawCommand.substr(separatorPos + strlen(PAYLOAD_SEPARATOR));
+    
+    // Trim whitespace from both
+    command = trimWhitespace(command);
+    payload = trimWhitespace(payload);
+    
+    return {command, payload};
+}
+
+// ============================================================================
+
+bool CommandServer::start()
+{
+    if (m_running) {
+        LOG(LogInfo) << "CommandServer: Already running";
+        return true;
+    }
+
+    // Thread-safe SDL event registration
+    std::call_once(s_sdlInitFlag, []() {
+        s_sdlEventType = SDL_RegisterEvents(1);
+        if (s_sdlEventType == (Uint32)-1) {
+            LOG(LogError) << "CommandServer: Failed to register SDL event type";
+        } else {
+            LOG(LogDebug) << "CommandServer: Registered SDL event type " << s_sdlEventType;
+        }
+    });
+
+    if (s_sdlEventType == (Uint32)-1 || s_sdlEventType == 0) {
+        LOG(LogError) << "CommandServer: SDL event type not available";
+        return false;
+    }
+
+    std::string fifoPath = getFifoPath();
+
+    // Remove existing FIFO if it exists
+    unlink(fifoPath.c_str());
+
+    // Create the FIFO with secure permissions
+    if (mkfifo(fifoPath.c_str(), FIFO_PERMISSIONS) < 0) {
+        LOG(LogError) << "CommandServer: Failed to create FIFO at " << fifoPath
+                      << " (errno: " << errno << ")";
+        return false;
+    }
+
+    // Open FIFO in non-blocking read mode
+    m_fifoFd = open(fifoPath.c_str(), O_RDONLY | O_NONBLOCK);
+    if (m_fifoFd < 0) {
+        LOG(LogError) << "CommandServer: Failed to open FIFO (errno: " << errno << ")";
+        unlink(fifoPath.c_str());
+        return false;
+    }
+
+    m_running = true;
+    m_serverThread = std::thread(&CommandServer::serverThreadFunc, this);
+    
+    LOG(LogInfo) << "CommandServer: Started on FIFO " << fifoPath;
+    return true;
+}
+
+void CommandServer::stop()
+{
+    if (!m_running) {
+        return;
+    }
+
+    m_running = false;
+    
+    if (m_serverThread.joinable()) {
+        m_serverThread.join();
+    }
+
+    if (m_fifoFd >= 0) {
+        close(m_fifoFd);
+        m_fifoFd = -1;
+    }
+
+    // Remove FIFO file
+    std::string fifoPath = getFifoPath();
+    unlink(fifoPath.c_str());
+    
+    LOG(LogInfo) << "CommandServer: Stopped";
+}
+
+void CommandServer::setPathOverride(const std::string& path)
+{
+    std::lock_guard<std::mutex> lock(m_pathOverrideMutex);
+    m_pendingPathOverride = path;
+}
+
+std::optional<std::string> CommandServer::consumePathOverride()
+{
+    std::lock_guard<std::mutex> lock(m_pathOverrideMutex);
+    std::optional<std::string> consumedPath = std::move(m_pendingPathOverride);
+    m_pendingPathOverride = std::nullopt;  // Clear the override
+    return consumedPath;
+}
+
+std::string CommandServer::getFifoPath() const
+{
+    // Try to get config directory from Settings
+    std::string configDir = Settings::getInstance()->getString("ConfigDirectory");
+
+    // If not set, construct the RetroDECK flatpak path
+    if (configDir.empty()) {
+        const char* home = getenv("HOME");
+        if (home) {
+            configDir = std::string(home) + "/.var/app/net.retrodeck.retrodeck/config";
+        } else {
+            configDir = "/tmp";
+        }
+    }
+
+    // Append ES-DE subdirectory
+    std::filesystem::path esdeDir = std::filesystem::path(configDir) / "ES-DE";
+
+    // Create the ES-DE subdirectory if it doesn't exist
+    if (!std::filesystem::exists(esdeDir)) {
+        std::error_code ec;
+        if (!std::filesystem::create_directories(esdeDir, ec)) {
+            LOG(LogError) << "CommandServer: Failed to create ES-DE directory "
+                          << esdeDir.string() << " (" << ec.message() << ")";
+        }
+    }
+
+    return (esdeDir / FIFO_NAME).string();
+}
+
+void CommandServer::serverThreadFunc()
+{
+    LOG(LogInfo) << "CommandServer: Server thread started";
+
+    char readBuffer[BUFFER_SIZE];
+    std::string accumulatedInput;
+
+    while (m_running) {
+        // 1. Wait for data to be available
+        if (!waitForData())
+            continue;
+
+        // 2. Read from FIFO and accumulate
+        if (!readAndAccumulate(readBuffer, accumulatedInput))
+            continue;
+
+        // 3. Process complete lines
+        processCompleteLines(accumulatedInput);
+    }
+}
+
+bool CommandServer::waitForData()
+{
+    fd_set readFds;
+    FD_ZERO(&readFds);
+    FD_SET(m_fifoFd, &readFds);
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = SELECT_TIMEOUT_MS * 1000; // Convert to microseconds
+
+    int numReadyFds = select(m_fifoFd + 1, &readFds, nullptr, nullptr, &timeout);
+
+    if (numReadyFds < 0) {
+        if (errno == EINTR) {
+            // Interrupted by signal, retry
+            return false;
+        }
+        LOG(LogError) << "CommandServer: select() failed (errno: " << errno << ")";
+        std::this_thread::sleep_for(std::chrono::milliseconds(SELECT_TIMEOUT_MS));
+        return false;
+    }
+
+    return numReadyFds > 0 && FD_ISSET(m_fifoFd, &readFds);
+}
+
+bool CommandServer::readAndAccumulate(char* readBuffer, std::string& accumulatedInput)
+{
+    ssize_t bytesRead = read(m_fifoFd, readBuffer, BUFFER_SIZE - 1);
+
+    if (bytesRead < 0) {
+        if (errno == EINTR) {
+            return false;
+        }
+        LOG(LogError) << "CommandServer: read() failed (errno: " << errno << ")";
+        return false;
+    }
+
+    if (bytesRead == 0) {
+        // EOF - FIFO closed, reopen it
+        LOG(LogInfo) << "CommandServer: FIFO closed by writer, reopening...";
+        close(m_fifoFd);
+        std::string fifoPath = getFifoPath();
+        m_fifoFd = open(fifoPath.c_str(), O_RDONLY | O_NONBLOCK);
+        if (m_fifoFd < 0) {
+            LOG(LogError) << "CommandServer: Failed to reopen FIFO";
+            m_running = false;
+            return false;
+        }
+        return false;
+    }
+
+    readBuffer[bytesRead] = '\0';
+    accumulatedInput.append(readBuffer);
+
+    // Prevent unbounded buffer growth (e.g., from data without newlines)
+    if (accumulatedInput.size() > MAX_COMMAND_BUFFER_SIZE) {
+        LOG(LogWarning) << "CommandServer: Command buffer overflow, clearing "
+                        << accumulatedInput.size() << " bytes";
+        accumulatedInput.clear();
+        return false;
+    }
+
+    return true;
+}
+
+void CommandServer::processCompleteLines(std::string& accumulatedInput)
+{
+    size_t newlinePos;
+    while ((newlinePos = accumulatedInput.find('\n')) != std::string::npos) {
+        std::string command = accumulatedInput.substr(0, newlinePos);
+        accumulatedInput.erase(0, newlinePos + 1);
+
+        // Trim whitespace using utility function
+        command = trimWhitespace(command);
+
+        if (!command.empty()) {
+            processCommand(command);
+        }
+    }
+}
+
+void CommandServer::processCommand(const std::string& rawCommand)
+{
+    LOG(LogDebug) << "CommandServer: Received raw input: " << rawCommand;
+
+    // Parse command and payload (if present)
+    auto [command, payload] = parseCommandWithPayload(rawCommand);
+    
+    // Validate command prefix
+    if (command.rfind(COMMAND_PREFIX, 0) != 0) {
+        LOG(LogWarning) << "CommandServer: Command must start with " << COMMAND_PREFIX 
+                        << ", got: " << command;
+        return;
+    }
+
+    LOG(LogDebug) << "CommandServer: Parsed command: " << command 
+                  << ", payload: " << (payload.empty() ? "(none)" : payload);
+
+    // Check if command is registered
+    auto commandIt = m_commandRegistry.find(command);
+    if (commandIt == m_commandRegistry.end()) {
+        LOG(LogWarning) << "CommandServer: Unknown command: " << command;
+        return;
+    }
+
+    const auto& [handler, shouldCoalesce] = commandIt->second;
+
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+
+    // Use full rawCommand for coalescing check (including payload)
+    if (shouldCoalesce) {
+        auto duplicateIt = std::find(m_commandQueue.begin(), m_commandQueue.end(), rawCommand);
+        if (duplicateIt != m_commandQueue.end()) {
+            LOG(LogDebug) << "CommandServer: " << rawCommand << " already pending, skipping duplicate";
+            return;
+        }
+    }
+
+    // Store the full command string for later execution
+    m_commandQueue.push_back(rawCommand);
+    LOG(LogInfo) << "CommandServer: Command queued: " << command 
+                 << (payload.empty() ? "" : " (with payload)");
+
+    // Notify main thread via SDL event
+    SDL_Event event;
+    event.type = s_sdlEventType;
+    event.user.code = 0;
+    event.user.data1 = nullptr;
+    event.user.data2 = nullptr;
+    
+    if (SDL_PushEvent(&event) != 1) {
+        LOG(LogError) << "CommandServer: Failed to push SDL event";
+    }
+}
+
+void CommandServer::executePendingCommands()
+{
+    std::vector<std::string> commandsToExecute;
+
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        // Early exit optimization - avoid swap if queue is empty
+        if (m_commandQueue.empty())
+            return;
+        commandsToExecute.swap(m_commandQueue);
+    }
+
+    for (const auto& rawCommand : commandsToExecute) {
+        LOG(LogInfo) << "CommandServer: Executing command: " << rawCommand;
+
+        // Parse command and payload, then execute
+        auto [command, payload] = parseCommandWithPayload(rawCommand);
+
+        auto commandIt = m_commandRegistry.find(command);
+        if (commandIt != m_commandRegistry.end()) {
+            commandIt->second.handler(payload);
+        } else {
+            LOG(LogWarning) << "CommandServer: Unknown command during execution: " << command;
+        }
+    }
+}
+
+std::string CommandServer::trimWhitespace(const std::string& str) const
+{
+    size_t start = str.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos)
+        return "";
+    
+    size_t end = str.find_last_not_of(" \t\r\n");
+    return str.substr(start, end - start + 1);
+}
+
+#endif // defined(RETRODECK)
