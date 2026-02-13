@@ -93,16 +93,16 @@ std::pair<std::string, std::string> CommandServer::parseCommandWithPayload(
     const std::string& rawCommand) const
 {
     // Look for the payload separator " ::"
-    size_t sepPos = rawCommand.find(PAYLOAD_SEPARATOR);
-    
-    if (sepPos == std::string::npos) {
+    size_t separatorPos = rawCommand.find(PAYLOAD_SEPARATOR);
+
+    if (separatorPos == std::string::npos) {
         // No payload - return command as-is with empty payload
         return {rawCommand, ""};
     }
-    
+
     // Extract command (before separator) and payload (after separator)
-    std::string command = rawCommand.substr(0, sepPos);
-    std::string payload = rawCommand.substr(sepPos + strlen(PAYLOAD_SEPARATOR));
+    std::string command = rawCommand.substr(0, separatorPos);
+    std::string payload = rawCommand.substr(separatorPos + strlen(PAYLOAD_SEPARATOR));
     
     // Trim whitespace from both
     command = trimWhitespace(command);
@@ -195,9 +195,9 @@ void CommandServer::setPathOverride(const std::string& path)
 std::optional<std::string> CommandServer::consumePathOverride()
 {
     std::lock_guard<std::mutex> lock(m_pathOverrideMutex);
-    std::optional<std::string> result = std::move(m_pendingPathOverride);
+    std::optional<std::string> consumedPath = std::move(m_pendingPathOverride);
     m_pendingPathOverride = std::nullopt;  // Clear the override
-    return result;
+    return consumedPath;
 }
 
 std::string CommandServer::getFifoPath() const
@@ -234,80 +234,100 @@ void CommandServer::serverThreadFunc()
 {
     LOG(LogInfo) << "CommandServer: Server thread started";
 
-    char buffer[BUFFER_SIZE];
-    std::string commandBuffer;
+    char readBuffer[BUFFER_SIZE];
+    std::string accumulatedInput;
 
     while (m_running) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(m_fifoFd, &readfds);
-
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = SELECT_TIMEOUT_MS * 1000; // Convert to microseconds
-
-        int ret = select(m_fifoFd + 1, &readfds, nullptr, nullptr, &tv);
-
-        if (ret < 0) {
-            if (errno == EINTR) {
-                // Interrupted by signal, retry
-                continue;
-            }
-            LOG(LogError) << "CommandServer: select() failed (errno: " << errno << ")";
-            std::this_thread::sleep_for(std::chrono::milliseconds(SELECT_TIMEOUT_MS));
+        // 1. Wait for data to be available
+        if (!waitForData())
             continue;
+
+        // 2. Read from FIFO and accumulate
+        if (!readAndAccumulate(readBuffer, accumulatedInput))
+            continue;
+
+        // 3. Process complete lines
+        processCompleteLines(accumulatedInput);
+    }
+}
+
+bool CommandServer::waitForData()
+{
+    fd_set readFds;
+    FD_ZERO(&readFds);
+    FD_SET(m_fifoFd, &readFds);
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = SELECT_TIMEOUT_MS * 1000; // Convert to microseconds
+
+    int numReadyFds = select(m_fifoFd + 1, &readFds, nullptr, nullptr, &timeout);
+
+    if (numReadyFds < 0) {
+        if (errno == EINTR) {
+            // Interrupted by signal, retry
+            return false;
         }
+        LOG(LogError) << "CommandServer: select() failed (errno: " << errno << ")";
+        std::this_thread::sleep_for(std::chrono::milliseconds(SELECT_TIMEOUT_MS));
+        return false;
+    }
 
-        if (ret > 0 && FD_ISSET(m_fifoFd, &readfds)) {
-            ssize_t bytesRead = read(m_fifoFd, buffer, sizeof(buffer) - 1);
+    return numReadyFds > 0 && FD_ISSET(m_fifoFd, &readFds);
+}
 
-            if (bytesRead < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                LOG(LogError) << "CommandServer: read() failed (errno: " << errno << ")";
-                continue;
-            }
+bool CommandServer::readAndAccumulate(char* readBuffer, std::string& accumulatedInput)
+{
+    ssize_t bytesRead = read(m_fifoFd, readBuffer, BUFFER_SIZE - 1);
 
-            if (bytesRead == 0) {
-                // EOF - FIFO closed, reopen it
-                LOG(LogInfo) << "CommandServer: FIFO closed by writer, reopening...";
-                close(m_fifoFd);
-                std::string fifoPath = getFifoPath();
-                m_fifoFd = open(fifoPath.c_str(), O_RDONLY | O_NONBLOCK);
-                if (m_fifoFd < 0) {
-                    LOG(LogError) << "CommandServer: Failed to reopen FIFO";
-                    m_running = false;
-                    return;
-                }
-                continue;
-            }
+    if (bytesRead < 0) {
+        if (errno == EINTR) {
+            return false;
+        }
+        LOG(LogError) << "CommandServer: read() failed (errno: " << errno << ")";
+        return false;
+    }
 
-            if (bytesRead > 0) {
-                buffer[bytesRead] = '\0';
-                commandBuffer.append(buffer);
+    if (bytesRead == 0) {
+        // EOF - FIFO closed, reopen it
+        LOG(LogInfo) << "CommandServer: FIFO closed by writer, reopening...";
+        close(m_fifoFd);
+        std::string fifoPath = getFifoPath();
+        m_fifoFd = open(fifoPath.c_str(), O_RDONLY | O_NONBLOCK);
+        if (m_fifoFd < 0) {
+            LOG(LogError) << "CommandServer: Failed to reopen FIFO";
+            m_running = false;
+            return false;
+        }
+        return false;
+    }
 
-                // Prevent unbounded buffer growth (e.g., from data without newlines)
-                if (commandBuffer.size() > MAX_COMMAND_BUFFER_SIZE) {
-                    LOG(LogWarning) << "CommandServer: Command buffer overflow, clearing "
-                                    << commandBuffer.size() << " bytes";
-                    commandBuffer.clear();
-                }
+    readBuffer[bytesRead] = '\0';
+    accumulatedInput.append(readBuffer);
 
-                // Process complete lines from the buffer
-                size_t pos;
-                while ((pos = commandBuffer.find('\n')) != std::string::npos) {
-                    std::string command = commandBuffer.substr(0, pos);
-                    commandBuffer.erase(0, pos + 1);
+    // Prevent unbounded buffer growth (e.g., from data without newlines)
+    if (accumulatedInput.size() > MAX_COMMAND_BUFFER_SIZE) {
+        LOG(LogWarning) << "CommandServer: Command buffer overflow, clearing "
+                        << accumulatedInput.size() << " bytes";
+        accumulatedInput.clear();
+        return false;
+    }
 
-                    // Trim whitespace using utility function
-                    command = trimWhitespace(command);
+    return true;
+}
 
-                    if (!command.empty()) {
-                        processCommand(command);
-                    }
-                }
-            }
+void CommandServer::processCompleteLines(std::string& accumulatedInput)
+{
+    size_t newlinePos;
+    while ((newlinePos = accumulatedInput.find('\n')) != std::string::npos) {
+        std::string command = accumulatedInput.substr(0, newlinePos);
+        accumulatedInput.erase(0, newlinePos + 1);
+
+        // Trim whitespace using utility function
+        command = trimWhitespace(command);
+
+        if (!command.empty()) {
+            processCommand(command);
         }
     }
 }
@@ -330,20 +350,20 @@ void CommandServer::processCommand(const std::string& rawCommand)
                   << ", payload: " << (payload.empty() ? "(none)" : payload);
 
     // Check if command is registered
-    auto it = m_commandRegistry.find(command);
-    if (it == m_commandRegistry.end()) {
+    auto commandIt = m_commandRegistry.find(command);
+    if (commandIt == m_commandRegistry.end()) {
         LOG(LogWarning) << "CommandServer: Unknown command: " << command;
         return;
     }
 
-    const auto& [handler, shouldCoalesce] = it->second;
+    const auto& [handler, shouldCoalesce] = commandIt->second;
 
     std::lock_guard<std::mutex> lock(m_queueMutex);
-    
+
     // Use full rawCommand for coalescing check (including payload)
     if (shouldCoalesce) {
-        auto dupIt = std::find(m_commandQueue.begin(), m_commandQueue.end(), rawCommand);
-        if (dupIt != m_commandQueue.end()) {
+        auto duplicateIt = std::find(m_commandQueue.begin(), m_commandQueue.end(), rawCommand);
+        if (duplicateIt != m_commandQueue.end()) {
             LOG(LogDebug) << "CommandServer: " << rawCommand << " already pending, skipping duplicate";
             return;
         }
@@ -368,32 +388,28 @@ void CommandServer::processCommand(const std::string& rawCommand)
 
 void CommandServer::executePendingCommands()
 {
-    std::vector<std::string> commands;
+    std::vector<std::string> commandsToExecute;
 
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
         // Early exit optimization - avoid swap if queue is empty
         if (m_commandQueue.empty())
             return;
-        commands.swap(m_commandQueue);
+        commandsToExecute.swap(m_commandQueue);
     }
 
-    for (const auto& command : commands) {
-        LOG(LogInfo) << "CommandServer: Executing command: " << command;
-        executeCommand(command);
-    }
-}
+    for (const auto& rawCommand : commandsToExecute) {
+        LOG(LogInfo) << "CommandServer: Executing command: " << rawCommand;
 
-void CommandServer::executeCommand(const std::string& rawCommand)
-{
-    // Parse command and payload again for execution
-    auto [command, payload] = parseCommandWithPayload(rawCommand);
-    
-    auto it = m_commandRegistry.find(command);
-    if (it != m_commandRegistry.end()) {
-        it->second.handler(payload);
-    } else {
-        LOG(LogWarning) << "CommandServer: Unknown command during execution: " << command;
+        // Parse command and payload, then execute
+        auto [command, payload] = parseCommandWithPayload(rawCommand);
+
+        auto commandIt = m_commandRegistry.find(command);
+        if (commandIt != m_commandRegistry.end()) {
+            commandIt->second.handler(payload);
+        } else {
+            LOG(LogWarning) << "CommandServer: Unknown command during execution: " << command;
+        }
     }
 }
 

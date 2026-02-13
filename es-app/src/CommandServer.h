@@ -69,8 +69,10 @@ private:
     static constexpr const char* PAYLOAD_SEPARATOR = " ::";
 
     void serverThreadFunc();
+    bool waitForData();
+    bool readAndAccumulate(char* readBuffer, std::string& accumulatedInput);
+    void processCompleteLines(std::string& accumulatedInput);
     void processCommand(const std::string& command);
-    void executeCommand(const std::string& command);
     void initializeCommandRegistry();
     void registerCommand(const std::string& name, CommandHandler handler, bool coalesce = false);
     std::string trimWhitespace(const std::string& str) const;

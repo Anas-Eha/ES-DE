@@ -2139,7 +2139,6 @@ void FileData::launchGame()
         LOG(LogDebug) << "FileData::launchGame(): Command BEFORE rebuild: " << command;
 
         // Simple string replacement: swap original paths with new paths.
-        // This preserves already-resolved emulator paths unlike commandRaw rebuild.
         command = Utils::String::replace(command, originalRomPath, romPath);
         command = Utils::String::replace(command, originalRomRaw, romRaw);
         command = Utils::String::replace(command, originalBaseName, baseName);
